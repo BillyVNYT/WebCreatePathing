@@ -16,9 +16,9 @@ function sampleGeometry(s,t){
   if(s.type==='turn')return {...s.p0}
   if(s.type==='linear'||s.type==='pose')return{x:s.p0.x+(s.p3.x-s.p0.x)*t,y:s.p0.y+(s.p3.y-s.p0.y)*t}
   if(s.type==='arc'){const c=s.center||{x:(s.p0.x+s.p3.x)/2,y:(s.p0.y+s.p3.y)/2},u=1-t;return{x:u*u*s.p0.x+2*u*t*c.x+t*t*s.p3.x,y:u*u*s.p0.y+2*u*t*c.y+t*t*s.p3.y}}
-  if(s.type==='polyline'||s.type==='spline'){
+  if(s.type==='polyline'||s.type==='spline'||s.type==='smart'){
     const pts=s.waypoints?.length>1?s.waypoints:[s.p0,s.p3]
-    if(s.type==='polyline'){const z=t*(pts.length-1),i=Math.min(pts.length-2,Math.floor(z)),u=z-i;return{x:pts[i].x+(pts[i+1].x-pts[i].x)*u,y:pts[i].y+(pts[i+1].y-pts[i].y)*u}}
+    if(s.type==='polyline'||(s.type==='smart'&&s.smartCurve===false)){const z=t*(pts.length-1),i=Math.min(pts.length-2,Math.floor(z)),u=z-i;return{x:pts[i].x+(pts[i+1].x-pts[i].x)*u,y:pts[i].y+(pts[i+1].y-pts[i].y)*u}}
     const z=t*(pts.length-1),i=Math.min(pts.length-2,Math.floor(z)),u=z-i,p0=pts[Math.max(0,i-1)],p1=pts[i],p2=pts[i+1],p3=pts[Math.min(pts.length-1,i+2)]
     const f=(a,b,c,d)=>.5*((2*b)+(-a+c)*u+(2*a-5*b+4*c-d)*u*u+(-a+3*b-3*c+d)*u*u*u)
     return{x:f(p0.x,p1.x,p2.x,p3.x),y:f(p0.y,p1.y,p2.y,p3.y)}
@@ -64,7 +64,7 @@ function FieldPerimeter({sizeX,sizeY}) {
   </group>
 }
 function Obstacles({items}) {
-  return <>{items.map(o=><mesh key={o.id} position={[o.y/1000,.12,o.x/1000]}><boxGeometry args={[o.size/1000,.24,o.size/1000]}/><meshStandardMaterial color="#e33b46" transparent opacity={.42}/></mesh>)}</>
+  return <>{items.map(o=><mesh key={o.id} position={[o.y/1000,.12,o.x/1000]}><boxGeometry args={[(o.width||o.size||420)/1000,.24,(o.length||o.size||420)/1000]}/><meshStandardMaterial color="#e33b46" transparent opacity={.42}/></mesh>)}</>
 }
 export default function Scene3D({segments=[],robot=null,field={},obstacles=[]}) {
   const sizeX=(field.length||3657.6)/1000,sizeY=(field.width||3657.6)/1000

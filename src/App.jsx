@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { Bot, Plus, Upload, Download, Play, Pause, Trash2, RotateCcw, MousePointer2, Route, Clock3, Settings2, Grid3X3, Eye, Box, Crosshair, ImagePlus, Copy, Code2, Square, ChevronLeft, ChevronRight } from 'lucide-react'
+import { Bot, Plus, Upload, Download, Play, Pause, Trash2, RotateCcw, MousePointer2, Route, Clock3, Settings2, Grid3X3, Eye, Box, Crosshair, ImagePlus, Copy, Code2, Square, ChevronLeft, ChevronRight, FolderOpen, WandSparkles } from 'lucide-react'
 import Scene3D from './Scene3D.jsx'
 
 const FIELD_MM = 3657.6
@@ -11,8 +11,7 @@ const MOVEMENT_TYPES = [
   {value:'pose',label:'Drive + turn',description:'Translate and rotate together'},
   {value:'turn',label:'Turn in place',description:'Rotate without translating'},
   {value:'arc',label:'Arc',description:'Curved quadratic arc'},
-  {value:'polyline',label:'Polyline',description:'Sharp waypoint turns'},
-  {value:'spline',label:'Spline',description:'Smooth multi-waypoint curve'}
+  {value:'smart',label:'Smart Route',description:'Generated from smart points'}
 ]
 const newSegment = (start, index=0, type='bezier')=>({
   id:uid(),name:`Path ${index+1}`,type,p0:{...start},
@@ -35,11 +34,11 @@ const pathPoint=(s,t)=>{
   if(s.type==='turn')return {...s.p0}
   if(s.type==='pose'||s.type==='linear')return{x:s.p0.x+(s.p3.x-s.p0.x)*t,y:s.p0.y+(s.p3.y-s.p0.y)*t}
   if(s.type==='arc')return quadratic(s.p0,s.center||{x:(s.p0.x+s.p3.x)/2,y:(s.p0.y+s.p3.y)/2},s.p3,t)
-  if(s.type==='polyline'){
+  if(s.type==='polyline'||(s.type==='smart'&&s.smartCurve===false)){
     const pts=s.waypoints?.length>=2?s.waypoints:[s.p0,s.p3],scaled=t*(pts.length-1),i=Math.min(pts.length-2,Math.floor(scaled)),u=scaled-i
     return{x:pts[i].x+(pts[i+1].x-pts[i].x)*u,y:pts[i].y+(pts[i+1].y-pts[i].y)*u}
   }
-  if(s.type==='spline')return catmull(s.waypoints?.length>=2?s.waypoints:[s.p0,s.p3],t)
+  if(s.type==='spline'||s.type==='smart')return catmull(s.waypoints?.length>=2?s.waypoints:[s.p0,s.p3],t)
   return bezier(s,t)
 }
 const samples=(s,n=100)=>Array.from({length:n+1},(_,i)=>pathPoint(s,i/n))
@@ -59,6 +58,22 @@ const metrics=(s)=>{
   return {length,time:motionTime(length,s.maxVelocity,s.maxAcceleration),pts,cumulative}
 }
 const fmt=(n)=>`${n.toFixed(2)} s`
+// 8-connected A* on a 100 mm grid; obstacles are expanded by a conservative robot clearance.
+function routeAroundZones(start,end,zones,field,clearance=220){
+  const cell=100, cols=Math.ceil(field.width/cell), rows=Math.ceil(field.length/cell)
+  const toCell=p=>({x:clamp(Math.round((p.y+field.width/2)/cell),0,cols),y:clamp(Math.round((field.length/2-p.x)/cell),0,rows)})
+  const toWorld=c=>({x:field.length/2-c.y*cell,y:c.x*cell-field.width/2})
+  const key=(x,y)=>`${x},${y}`
+  const pointBlocked=p=>Math.abs(p.x)>field.length/2+100||Math.abs(p.y)>field.width/2+100||zones.some(z=>Math.abs(p.x-z.x)<(z.length||z.size||420)/2+clearance&&Math.abs(p.y-z.y)<(z.width||z.size||420)/2+clearance)
+  const blocked=(x,y)=>pointBlocked(toWorld({x,y}))
+  const snapSafe=p=>{if(!pointBlocked(p))return p;let best=null,bestDistance=Infinity;for(let y=0;y<=rows;y++)for(let x=0;x<=cols;x++){const candidate=toWorld({x,y}),distance=Math.hypot(candidate.x-p.x,candidate.y-p.y);if(distance<bestDistance&&!blocked(x,y)){best=candidate;bestDistance=distance}}return best}
+  const safeStart=snapSafe(start),safeEnd=snapSafe(end);if(!safeStart||!safeEnd)return null
+  const a=toCell(safeStart),b=toCell(safeEnd),open=[{...a,g:0,f:Math.hypot(a.x-b.x,a.y-b.y)}],came=new Map(),cost=new Map([[key(a.x,a.y),0]]),closed=new Set()
+  const moves=[[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]]
+  while(open.length){open.sort((u,v)=>u.f-v.f);const cur=open.shift(),ck=key(cur.x,cur.y);if(closed.has(ck))continue;if(cur.x===b.x&&cur.y===b.y){const path=[{x:cur.x,y:cur.y}];let k=ck;while(came.has(k)){k=came.get(k);const [x,y]=k.split(',').map(Number);path.push({x,y})}path.reverse();const compact=path.filter((p,i)=>i===0||i===path.length-1||((p.x-path[i-1].x)*(path[i+1].y-p.y)!==(p.y-path[i-1].y)*(path[i+1].x-p.x)));return [safeStart,...compact.slice(1,-1).map(toWorld),safeEnd]}
+    closed.add(ck);for(const [dx,dy] of moves){const x=cur.x+dx,y=cur.y+dy,k=key(x,y);if(x<0||y<0||x>cols||y>rows||closed.has(k)||(blocked(x,y)&&!(x===b.x&&y===b.y)))continue;if(dx&&dy&&((blocked(cur.x+dx,cur.y)&&!(cur.x+dx===b.x&&cur.y===b.y))||(blocked(cur.x,cur.y+dy)&&!(cur.x===b.x&&cur.y+dy===b.y))))continue;const g=cur.g+(dx&&dy?1.414:1);if(g>=(cost.get(k)??Infinity))continue;cost.set(k,g);came.set(k,ck);open.push({x,y,g,f:g+Math.hypot(x-b.x,y-b.y)})}}
+  return null
+}
 function headingAt(s,t,dx,dy,fallback=0){
   if(s.headingMode==='tangent')return Math.atan2(dy,dx)*180/Math.PI
   const start=Number(s.headingStart??fallback),end=Number(s.headingEnd??start)
@@ -96,8 +111,15 @@ function poseAtTime(segments, time, startPose) {
 }
 function toRobotFrame(p, robot){
   const dx=p.x-robot.x,dy=p.y-robot.y,h=(robot.heading||0)*Math.PI/180,c=Math.cos(h),s=Math.sin(h)
-  return {x:dx*c+dy*s,y:-dx*s+dy*c}
+  // Inverse of BillyDriveLib's robot-to-field transform (forward, right).
+  return {x:dx*c-dy*s,y:dx*s+dy*c}
 }
+function routeIsSafe(points,zones,field,clearance=220){
+  if(points.length<2)return true
+  const spline={type:'spline',waypoints:points},path=samples(spline,Math.max(100,points.length*40))
+  return path.every(p=>Math.abs(p.x)<=field.length/2-clearance&&Math.abs(p.y)<=field.width/2-clearance&&!zones.some(z=>Math.abs(p.x-z.x)<(z.length||z.size||420)/2+clearance&&Math.abs(p.y-z.y)<(z.width||z.size||420)/2+clearance))
+}
+const routeLength=pts=>pts.slice(1).reduce((sum,p,i)=>sum+Math.hypot(p.x-pts[i].x,p.y-pts[i].y),0)
 const javaNumber=(n)=>Number(n).toFixed(1)
 function exportJava(segments, robot, className) {
   const safe=(className.replace(/[^a-zA-Z0-9_]/g,'')||'BillyAuto')
@@ -135,15 +157,11 @@ function exportJava(segments, robot, className) {
     usedNames.add(name)
     return name
   }
-  const appendBezierHeadingAction=(chunk,startHeading,endHeading,label)=>{
-    const [p0,p1,p2,p3]=chunk.map(rel)
-    const h0=heading(startHeading),h3=heading(endHeading)
-    calls.push(`${label}\n    .then(new BillyDriveLib.Action() {\n        @Override\n        public void start(BillyDriveLib.BillyDrive d) {\n            d.followPath(new BillyDriveLib.BezierCurve(\n                new BillyDriveLib.Pose2D(${javaNumber(p0.x)}, ${javaNumber(p0.y)}, ${h0.toFixed(2)}),\n                new BillyDriveLib.Pose2D(${javaNumber(p1.x)}, ${javaNumber(p1.y)}, 0),\n                new BillyDriveLib.Pose2D(${javaNumber(p2.x)}, ${javaNumber(p2.y)}, 0),\n                new BillyDriveLib.Pose2D(${javaNumber(p3.x)}, ${javaNumber(p3.y)}, ${h3.toFixed(2)})\n            ), BillyDriveLib.BillyDrive.HeadingMode.LINEAR);\n        }\n        @Override\n        public void update(BillyDriveLib.BillyDrive d) {\n            d.update();\n            if (!d.isBusy()) finish();\n        }\n    })`)
-  }
   segments.forEach((s,index)=>{
     const label=`// ${String(index+1).padStart(2,'0')} · ${s.name} · ${s.type.toUpperCase()} · ${(metrics(s).length/10).toFixed(1)} cm`
     if(s.type==='turn'){
       calls.push(`${label}\n    .turnTo(${heading(s.headingEnd).toFixed(2)})`)
+      if(s.maxAngularVelocity!==180||s.maxAngularAcceleration!==360)warnings.push(`${s.name}: BillyDriveLib v2.1 turnTo() uses global turn configuration; per-turn angular constraints are not applied.`)
     } else if(s.type==='pose'){
       const end=rel(s.p3)
       calls.push(`${label}\n    .lineToPose(${javaNumber(end.x)}, ${javaNumber(end.y)}, ${heading(s.headingEnd).toFixed(2)})`)
@@ -155,7 +173,7 @@ function exportJava(segments, robot, className) {
         calls.push(`${label}\n    .lineTo(${javaNumber(end.x)}, ${javaNumber(end.y)})`)
         if(s.headingMode==='tangent') warnings.push(`${s.name}: lineTo() không hỗ trợ tangent heading; đã export dưới dạng giữ heading.`)
       }
-    } else if(s.type==='polyline'){
+    } else if(s.type==='polyline'||(s.type==='smart'&&s.smartCurve===false)){
       const pts=(s.waypoints?.length>=2?s.waypoints:[s.p0,s.p3]).slice(1)
       pts.forEach((p,j)=>{const q=rel(p);calls.push(`${j===0?label:`// ${s.name} · waypoint ${j+1}`}\n    .lineTo(${javaNumber(q.x)}, ${javaNumber(q.y)})`)})
       if(s.headingMode==='tangent') warnings.push(`${s.name}: Polyline tangent heading chưa được BillyDriveLib PathBuilder hỗ trợ.`)
@@ -165,16 +183,11 @@ function exportJava(segments, robot, className) {
       const hasLinearHeading=s.headingMode==='linear'||s.headingMode==='interpolated'
       chunks.forEach((chunk,j)=>{
         const firstLabel=j===0?label:`// ${s.name} · curve section ${j+1}/${chunks.length}`
-        if(hasLinearHeading){
-          const h0=Number(s.headingStart||0)+(Number(s.headingEnd||0)-Number(s.headingStart||0))*j/chunks.length
-          const h1=Number(s.headingStart||0)+(Number(s.headingEnd||0)-Number(s.headingStart||0))*(j+1)/chunks.length
-          appendBezierHeadingAction(chunk,h0,h1,firstLabel)
-        } else {
-          const [,p1,p2,p3]=chunk.map(rel)
-          calls.push(`${firstLabel}\n    .splineTo(${javaNumber(p1.x)}, ${javaNumber(p1.y)},\n             ${javaNumber(p2.x)}, ${javaNumber(p2.y)},\n             ${javaNumber(p3.x)}, ${javaNumber(p3.y)})`)
-        }
+        const [,p1,p2,p3]=chunk.map(rel)
+        calls.push(`${firstLabel}\n    .splineTo(${javaNumber(p1.x)}, ${javaNumber(p1.y)},\n             ${javaNumber(p2.x)}, ${javaNumber(p2.y)},\n             ${javaNumber(p3.x)}, ${javaNumber(p3.y)})`)
       })
-      if(s.headingMode==='tangent') warnings.push(`${s.name}: BillyDriveLib hiện chỉ hỗ trợ CONSTANT và LINEAR cho followPath(); tangent heading chưa có API tương ứng.`)
+      if(s.headingMode==='tangent') warnings.push(`${s.name}: splineTo() giữ heading hiện tại; BillyDriveLib v2.1 chưa hỗ trợ tangent heading.`)
+      else if(hasLinearHeading) warnings.push(`${s.name}: splineTo() giữ heading hiện tại; heading interpolation chỉ áp dụng qua lineToPose().`)
     }
     ;(s.actions||[]).forEach((action,actionIndex)=>{
       const method=uniqueMethod(action.name,helperNames.length)
@@ -185,7 +198,9 @@ function exportJava(segments, robot, className) {
   const chain=calls.length?`        boolean pathCompleted = drive.path()\n${calls.join('\n')}\n    .waitToFinish(this, 15.0);`:`        boolean pathCompleted = true; // No motion segments were added.`
   const warningBlock=warnings.length?`// EXPORT NOTES:\n${[...new Set(warnings)].map(w=>`// - ${w}`).join('\n')}\n// Review these notes before running the OpMode.\n`:'// Heading and movement commands are exported using BillyDriveLib APIs.\n'
   const helpers=helperNames.length?`\n\n    // Custom action hooks. Add your mechanism code inside each method.\n${helperNames.map(name=>`    private void ${name}() {\n        // TODO: Add your custom code here.\n        // Example: claw.setPosition(0.7);\n    }`).join('\n\n')}\n`:''
-  return `// Generated by BillyPath Studio\n// BillyDriveLib PathBuilder style\n// Coordinates are relative to the robot start pose, in millimeters.\n// +X = forward, +Y = right, positive heading = counter-clockwise.\n${warningBlock}import com.qualcomm.robotcore.eventloop.opmode.Autonomous;\nimport com.qualcomm.robotcore.eventloop.opmode.LinearOpMode;\nimport org.firstinspires.ftc.teamcode.JavaOnRobot.JavaOnRobot.BillyDriveLib;\n\n@Autonomous(name = "${safe}", group = "BillyPath")\npublic class ${safe} extends LinearOpMode {\n    @Override\n    public void runOpMode() {\n        BillyDriveLib.BillyDrive drive =\n                new BillyDriveLib.BillyDrive(hardwareMap);\n\n        drive.setMaxPowers(0.30, 0.22);\n        drive.resetPose();\n\n        telemetry.addLine("BillyPath ready");\n        telemetry.addLine("Check motor mapping, IMU and odometry offsets");\n        telemetry.update();\n\n        waitForStart();\n        if (isStopRequested()) return;\n\n${chain}\n\n        telemetry.addData("Path", pathCompleted ? "COMPLETE" : "STOPPED / TIMEOUT");\n        telemetry.update();\n        drive.stop();\n    }${helpers}\n}\n`
+  const minVelocity=segments.filter(s=>s.type!=='turn').reduce((v,s)=>Math.min(v,Number(s.maxVelocity)||250),Infinity)
+  const minAcceleration=segments.filter(s=>s.type!=='turn').reduce((v,s)=>Math.min(v,Number(s.maxAcceleration)||450),Infinity)
+  return `// Generated by BillyPath Studio for BillyDriveLib v2.1\n// Coordinates are relative to the robot start pose, in millimeters.\n// +X = forward, +Y = right, positive heading = counter-clockwise.\n${warningBlock}package org.firstinspires.ftc.teamcode.JavaOnRobot.JavaOnRobot;\n\nimport com.qualcomm.robotcore.eventloop.opmode.Autonomous;\nimport com.qualcomm.robotcore.eventloop.opmode.LinearOpMode;\n\n@Autonomous(name = "${safe}", group = "BillyPath")\npublic class ${safe} extends LinearOpMode {\n    @Override\n    public void runOpMode() {\n        BillyDriveLib.BillyDrive.ConfigValues.PP_MAX_VELOCITY_MM_S = Math.min(\n                BillyDriveLib.BillyDrive.ConfigValues.PP_MAX_VELOCITY_MM_S, ${Number.isFinite(minVelocity)?javaNumber(minVelocity):'450.0'});\n        BillyDriveLib.BillyDrive.ConfigValues.PP_MAX_ACCEL_MM_S2 = Math.min(\n                BillyDriveLib.BillyDrive.ConfigValues.PP_MAX_ACCEL_MM_S2, ${Number.isFinite(minAcceleration)?javaNumber(minAcceleration):'900.0'});\n        BillyDriveLib.BillyDrive drive = new BillyDriveLib.BillyDrive(hardwareMap);\n        drive.setMaxPowers(BillyDriveLib.BillyDrive.ConfigValues.MAX_MOVE_POWER,\n                BillyDriveLib.BillyDrive.ConfigValues.MAX_TURN_POWER);\n        drive.resetPose();\n\n        telemetry.addLine("BillyPath ready · BillyDriveLib v2.1");\n        telemetry.addLine("Check motor mapping, odometry and offsets");\n        telemetry.update();\n        waitForStart();\n        if (isStopRequested()) { drive.cancel(); return; }\n\n${chain}\n\n        telemetry.addData("Path", pathCompleted ? "COMPLETE" : "STOPPED / TIMEOUT");\n        telemetry.update();\n        drive.stop();\n    }${helpers}\n}\n`
 }
 function App(){
   const [field,setField]=useState({length:FIELD_MM,width:FIELD_MM,preset:'custom'})
@@ -196,6 +211,8 @@ function App(){
   const [selectedPoint,setSelectedPoint]=useState('p3')
   const [obstacles,setObstacles]=useState([])
   const [selectedObstacle,setSelectedObstacle]=useState(-1)
+  const [smartPoints,setSmartPoints]=useState([])
+  const [selectedSmartPoint,setSelectedSmartPoint]=useState(-1)
   const [image,setImage]=useState(null)
   const [view,setView]=useState('2d')
   const [playing,setPlaying]=useState(false)
@@ -204,8 +221,10 @@ function App(){
   const [showLabels,setShowLabels]=useState(true)
   const [tool,setTool]=useState('select')
   const [addZone,setAddZone]=useState(false)
+  const [addSmartPoint,setAddSmartPoint]=useState(false)
   const [className,setClassName]=useState('BillyAuto')
   const [exportOpen,setExportOpen]=useState(false)
+  const projectFileRef=useRef(null)
   const [toast,setToast]=useState('')
   const [drag,setDrag]=useState(null)
   const [rightOpen,setRightOpen]=useState(true)
@@ -257,14 +276,17 @@ function App(){
     if(s.waypoints?.length){s.waypoints[0]={...start};s.waypoints[s.waypoints.length-1]={...s.p3}}
     setSegments(old=>[...old,s]);setSelected(segments.length);setSelectedPoint('p3');setCurrentTime(totalTime);setPlaying(false)
   }
-  const deletePath=()=>{if(selected<0)return;setSegments(old=>{const next=old.filter((_,i)=>i!==selected).map(s=>({...s,p0:{...s.p0},p1:{...s.p1},p2:{...s.p2},p3:{...s.p3}}));if(next.length&&robot)next[0].p0={x:robot.x,y:robot.y};for(let i=1;i<next.length;i++)next[i].p0={...next[i-1].p3};return next});setSelected(Math.max(-1,selected-1));setCurrentTime(0)}
+  const deletePath=()=>{if(selected<0)return;setSegments(old=>{const next=old.filter((_,i)=>i!==selected).map(s=>({...s,p0:{...s.p0},p1:{...s.p1},p2:{...s.p2},p3:{...s.p3},waypoints:(s.waypoints||[]).map(p=>({...p}))}));if(next.length&&robot){next[0].p0={x:robot.x,y:robot.y};if(next[0].waypoints?.length)next[0].waypoints[0]={...next[0].p0}}for(let i=1;i<next.length;i++){next[i].p0={...next[i-1].p3};if(next[i].waypoints?.length)next[i].waypoints[0]={...next[i].p0}}return next});setSelected(Math.max(-1,selected-1));setCurrentTime(0)}
+  const movePath=delta=>{const to=selected+delta;if(selected<0||to<0||to>=segments.length)return;setSegments(old=>{const next=[...old],moved=next.splice(selected,1)[0];next.splice(to,0,moved);for(let i=0;i<next.length;i++){const start=i===0?(robot||next[i].p0):next[i-1].p3;next[i]={...next[i],p0:{x:start.x,y:start.y},waypoints:next[i].waypoints?.map(p=>({...p}))};if(next[i].waypoints?.length)next[i].waypoints[0]={...next[i].p0};if(next[i].type==='turn')next[i].p3={...next[i].p0}}return next});setSelected(to);setCurrentTime(0);notify(`Đã chuyển ${seg.name} ${delta<0?'lên trước':'xuống sau'}`)}
+  const removeObstacle=index=>{setObstacles(old=>old.filter((_,i)=>i!==index));setSelectedObstacle(-1);notify('Đã xóa vùng cấm')}
+  const moveObstacle=delta=>{const to=selectedObstacle+delta;if(selectedObstacle<0||to<0||to>=obstacles.length)return;setObstacles(old=>{const next=[...old],item=next.splice(selectedObstacle,1)[0];next.splice(to,0,item);return next});setSelectedObstacle(to)}
   const addActionMarker=()=>{if(selected<0)return;setSegments(old=>old.map((s,i)=>i===selected?{...s,actions:[...(s.actions||[]),{id:uid(),name:`onAction${(s.actions||[]).length+1}`}]}:s));notify('Đã thêm action marker sau segment này')}
   const updateActionMarker=(actionId,name)=>setSegments(old=>old.map((s,i)=>i===selected?{...s,actions:(s.actions||[]).map(a=>a.id===actionId?{...a,name}:a)}:s))
   const removeActionMarker=(actionId)=>setSegments(old=>old.map((s,i)=>i===selected?{...s,actions:(s.actions||[]).filter(a=>a.id!==actionId)}:s))
-  const onImage=(e)=>{const f=e.target.files?.[0];if(!f)return;const url=URL.createObjectURL(f);setImage(url);const im=new Image();im.onload=()=>imageRef.current=im;im.src=url}
+  const onImage=(e)=>{const f=e.target.files?.[0];if(!f)return;const reader=new FileReader();reader.onload=()=>{const data=String(reader.result);setImage(data);const im=new Image();im.onload=()=>imageRef.current=im;im.src=data};reader.readAsDataURL(f)}
   const setPreset=(preset)=>{
     setField({length:FIELD_MM,width:FIELD_MM,preset})
-    setSegments([]);setSelected(-1);setCurrentTime(0);setPlaying(false)
+    setSegments([]);setSmartPoints([]);setSelectedSmartPoint(-1);setSelected(-1);setCurrentTime(0);setPlaying(false)
     notify(`${preset==='decode'?'DECODE':preset==='biobuzz'?'BIOBUZZ':'Custom'} field loaded`)
   }
   const svgPoint=(e)=>{
@@ -275,21 +297,25 @@ function App(){
   const onDown=(e)=>{
     if(!svgRef.current)return
     const p=svgPoint(e),target=e.target
-    if(addZone){setObstacles(old=>[...old,{id:uid(),x:p.x,y:p.y,size:420}]);setSelectedObstacle(obstacles.length);setAddZone(false);notify('Vùng cấm hình vuông đã được thêm');return}
+    if(addZone){setObstacles(old=>[...old,{id:uid(),name:`Zone ${old.length+1}`,x:p.x,y:p.y,length:420,width:420}]);setSelectedObstacle(obstacles.length);setSelected(-1);setSelectedSmartPoint(-1);setAddZone(false);notify('Vùng cấm hình chữ nhật đã được thêm');return}
+    if(addSmartPoint){setSmartPoints(old=>[...old,{id:uid(),name:`Smart Point ${old.length+1}`,x:p.x,y:p.y}]);setSelectedSmartPoint(smartPoints.length);setSelectedObstacle(-1);setAddSmartPoint(false);notify('Đã thêm Smart Point · kéo để chỉnh vị trí');return}
+    if(target.dataset.smartPoint!==undefined){const index=Number(target.dataset.smartPoint);setSelectedSmartPoint(index);setSelectedObstacle(-1);setDrag({kind:'smartPoint',index});e.currentTarget.setPointerCapture(e.pointerId);return}
     if(target.dataset.robot==='true'){setDrag({kind:'robot'});e.currentTarget.setPointerCapture(e.pointerId);return}
-    if(target.dataset.obstacle){setSelectedObstacle(Number(target.dataset.obstacle));setDrag({kind:'obstacle',index:Number(target.dataset.obstacle)});e.currentTarget.setPointerCapture(e.pointerId);return}
-    if(target.dataset.resize){setDrag({kind:'resize',index:Number(target.dataset.resize)});e.currentTarget.setPointerCapture(e.pointerId);return}
+    if(target.dataset.obstacle!==undefined){const index=Number(target.dataset.obstacle);setSelectedObstacle(index);setSelected(-1);setSelectedSmartPoint(-1);setDrag({kind:'obstacle',index});e.currentTarget.setPointerCapture(e.pointerId);return}
+    if(target.dataset.resizeLength!==undefined||target.dataset.resizeWidth!==undefined){const index=Number(target.dataset.resizeLength??target.dataset.resizeWidth);setSelectedObstacle(index);setSelected(-1);setSelectedSmartPoint(-1);setDrag({kind:target.dataset.resizeLength!==undefined?'resizeLength':'resizeWidth',index});e.currentTarget.setPointerCapture(e.pointerId);return}
     if(target.dataset.point&&selected>=0){setSelectedPoint(target.dataset.point);setDrag({kind:'point',key:target.dataset.point,index:selected});e.currentTarget.setPointerCapture(e.pointerId);return}
-    if(target.dataset.segment){setSelected(Number(target.dataset.segment));return}
+    if(target.dataset.segment!==undefined){setSelected(Number(target.dataset.segment));setSelectedObstacle(-1);setSelectedSmartPoint(-1);return}
     if(tool==='pan'){setDrag({kind:'pan',x:e.clientX,y:e.clientY});return}
   }
   const onMove=(e)=>{
     if(!drag)return
     const p=svgPoint(e)
     if(drag.kind==='robot')setRobot(r=>({...r,x:p.x,y:p.y}))
+    if(drag.kind==='smartPoint')setSmartPoints(old=>old.map((point,i)=>i===drag.index?{...point,x:p.x,y:p.y}:point))
     if(drag.kind==='point')updatePoint(drag.index,drag.key,'x',p.x),updatePoint(drag.index,drag.key,'y',p.y)
     if(drag.kind==='obstacle')setObstacles(old=>old.map((o,i)=>i===drag.index?{...o,x:p.x,y:p.y}:o))
-    if(drag.kind==='resize')setObstacles(old=>old.map((o,i)=>i===drag.index?{...o,size:Math.max(80,Math.round(Math.max(Math.abs(p.x-o.x),Math.abs(p.y-o.y))*2))}:o))
+    if(drag.kind==='resizeLength')setObstacles(old=>old.map((o,i)=>i===drag.index?{...o,length:Math.max(100,Math.round(Math.abs(p.x-o.x)*2))}:o))
+    if(drag.kind==='resizeWidth')setObstacles(old=>old.map((o,i)=>i===drag.index?{...o,width:Math.max(100,Math.round(Math.abs(p.y-o.y)*2))}:o))
   }
   const seek=(t)=>{const n=clamp(Number(t),0,totalTime||0);simTimeRef.current=n;setPlaying(false);setCurrentTime(n)}
   const play=()=>{if(!robot||!segments.length){notify('Tạo robot và ít nhất một path để simulate');return}if(playing){setPlaying(false);return}const start=currentTime>=totalTime?0:currentTime;simTimeRef.current=start;setCurrentTime(start);setPlaying(true)}
@@ -321,16 +347,26 @@ function App(){
   const code=robot?exportJava(segments,robot,className):''
   const copyCode=async()=>{await navigator.clipboard.writeText(code);notify('Đã copy Java code')}
   const downloadCode=()=>{const blob=new Blob([code],{type:'text/x-java'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`${className||'BillyAuto'}.java`;a.click();URL.revokeObjectURL(url);notify('Đã export Java')}
+  const saveProject=()=>{const data={format:'billypath-project',version:2,field,robot,segments,obstacles,smartPoints,className,imageData:image||null};const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`${className||'BillyPath'}.billypath.json`;a.click();URL.revokeObjectURL(url);notify('Đã lưu project để mở và chỉnh sửa sau')}
+  const openProject=async e=>{const file=e.target.files?.[0];if(!file)return;try{const data=JSON.parse(await file.text());if(data.format!=='billypath-project'||!Array.isArray(data.segments)||!data.field)throw new Error('Sai định dạng BillyPath project');setField(data.field);setRobot(data.robot||null);setSegments(data.segments.map(s=>s.type==="polyline"||s.type==="spline"?{...s,type:"smart",smartCurve:s.type==="spline"}:s));setObstacles(data.obstacles||[]);setSmartPoints(data.smartPoints?.length?data.smartPoints:(data.segments.find(s=>s.type==="polyline"||s.type==="spline")?.waypoints||[]).slice(1).map((p,i)=>({id:uid(),name:`Smart Point ${i+1}`,...p})));setImage(data.imageData||null);if(data.imageData){const im=new Image();im.onload=()=>imageRef.current=im;im.src=data.imageData}else imageRef.current=null;setClassName(data.className||'BillyAuto');setSelected(-1);setSelectedObstacle(-1);setSelectedSmartPoint(-1);setAddZone(false);setAddSmartPoint(false);setCurrentTime(0);setPlaying(false);notify('Đã mở project · có thể tiếp tục chỉnh sửa')}catch(err){notify(`Không mở được file: ${err.message}`)}e.target.value=''}
   const activeSegmentIndex=()=>{let t=currentTime;for(let i=0;i<segments.length;i++){const d=metrics(segments[i]).time;if(t<=d)return i;t-=d}return Math.max(0,segments.length-1)}
   const activeIndex=activeSegmentIndex()
-  const addObstacle=()=>{if(!robot){notify('Tạo robot trước');return}setAddZone(true);setTool('select')}
+  const addObstacle=()=>{if(!robot){notify('Tạo robot trước');return}setAddSmartPoint(false);setAddZone(true);setTool('select')}
+  const beginAddSmartPoint=()=>{if(!robot){notify('Tạo robot trước');return}setAddSmartPoint(true);setAddZone(false);setTool('select');notify('Bấm vào field để đặt Smart Point')}
+  const removeSmartPoint=index=>{setSmartPoints(old=>old.filter((_,i)=>i!==index));setSelectedSmartPoint(-1)}
+  const moveSmartPoint=delta=>{const to=selectedSmartPoint+delta;if(selectedSmartPoint<0||to<0||to>=smartPoints.length)return;setSmartPoints(old=>{const next=[...old],item=next.splice(selectedSmartPoint,1)[0];next.splice(to,0,item);return next});setSelectedSmartPoint(to)}
   const optimize=()=>{
-    if(selected<0||!obstacles.length){notify('Chọn path và thêm vùng cấm trước');return}
-    const s=seg,o=obstacles[0],dx=s.p3.x-s.p0.x,dy=s.p3.y-s.p0.y,len=Math.hypot(dx,dy)||1
-    const side=Math.sign(dx*(o.y-s.p0.y)-dy*(o.x-s.p0.x))||1
-    const nx=-dy/len*side,ny=dx/len*side,offset=o.size/2+260
-    updateSegment(selected,{p1:{x:s.p1.x+nx*offset,y:s.p1.y+ny*offset},p2:{x:s.p2.x+nx*offset,y:s.p2.y+ny*offset}})
-    notify('Đã đề xuất đường vòng · kiểm tra va chạm trước khi chạy')
+    if(!robot){notify('Tạo robot trước');return}
+    if(!smartPoints.length){notify('Thêm ít nhất một Smart Point trên field trước');return}
+    if(seg?.type==='turn'){notify('Hãy chọn path di chuyển hoặc bỏ chọn path trước');return}
+    const start=selected>=0?seg.p0:segments.length?segments[segments.length-1].p3:robot,route=[start],resolvedPoints=[];let cursor=start
+    for(const point of smartPoints){const leg=routeAroundZones(cursor,point,obstacles,field);if(!leg){notify(`Không tìm được đường tới ${point.name}; hãy chuyển điểm hoặc vùng cấm`);return}route.push(...leg.slice(1));cursor=leg[leg.length-1];resolvedPoints.push(cursor)}
+    setSmartPoints(old=>old.map((p,i)=>({...p,x:resolvedPoints[i].x,y:resolvedPoints[i].y})))
+    const straightLength=routeLength(route),smoothSafe=route.length>2&&routeIsSafe(route,obstacles,field),smoothLength=smoothSafe?metrics({type:'spline',waypoints:route,maxVelocity:250,maxAcceleration:450}).length:Infinity
+    const smartCurve=smoothSafe&&smoothLength<=straightLength*1.08,type=route.length===2?'linear':'smart',autoSegment={...newSegment(route[0],selected>=0?selected:segments.length,type),name:'Smart Route',type,smartCurve,waypoints:route,p0:{...route[0]},p3:{...route[route.length-1]}}
+    if(selected>=0)updateSegment(selected,autoSegment)
+    else {setSegments(old=>[...old,autoSegment]);setSelected(segments.length);setSelectedObstacle(-1);setSelectedSmartPoint(-1)}
+    notify(`Đã tạo ${smartCurve?'đường cong an toàn':'đường đi thẳng'} qua ${smartPoints.length} Smart Point${obstacles.length?` · né ${obstacles.length} vùng cấm`:''}`)
   }
   const fieldDecoration=()=>{
     const items=[]
@@ -349,12 +385,12 @@ function App(){
     <header className="topbar">
       <div className="brand"><div className="brand-mark"><Route size={19}/></div><div><div className="brand-name">BILLYPATH <span>STUDIO</span></div><div className="brand-sub">FTC AUTONOMOUS PATH DESIGNER</div></div></div>
       <div className="top-center"><span className="status-dot"/><span>{robot?'Robot ready':'No robot created'}</span><span className="top-divider"/><span>{field.preset.toUpperCase()} · {Math.round(field.length)} × {Math.round(field.width)} mm</span></div>
-      <div className="top-actions"><button className="btn ghost" onClick={()=>{setRobot(null);setSegments([]);setSelected(-1);setObstacles([]);setCurrentTime(0);setPlaying(false);notify('Project đã reset')}}><Plus size={14}/> New</button><button className="btn primary" disabled={!robot||!segments.length} onClick={()=>setExportOpen(true)}><Download size={14}/> Export Java</button></div>
+      <div className="top-actions"><input ref={projectFileRef} type="file" accept=".json,.billypath.json,application/json" hidden onChange={openProject}/><button className="btn ghost" onClick={()=>projectFileRef.current?.click()}><FolderOpen size={14}/> Open</button><button className="btn ghost" onClick={saveProject}><Download size={14}/> Save project</button><button className="btn ghost" onClick={()=>{setRobot(null);setSegments([]);setSelected(-1);setObstacles([]);setSmartPoints([]);setSelectedSmartPoint(-1);setAddZone(false);setAddSmartPoint(false);setCurrentTime(0);setPlaying(false);notify('Project đã reset')}}><Plus size={14}/> New</button><button className="btn primary" disabled={!robot||!segments.length} onClick={()=>setExportOpen(true)}><Code2 size={14}/> Export Java</button></div>
     </header>
     <div className="workspace">
       <aside className={`left-panel ${leftOpen?'':'collapsed'}`}>
         <div className="panel-heading"><span>PROJECT & FIELD</span><button className="icon-btn panel-collapse" onClick={()=>setLeftOpen(v=>!v)}><ChevronLeft size={15}/></button></div>
-        <div className="project-card"><div className="project-icon"><Bot size={18}/></div><div className="project-info"><b>FTC Autonomous</b><small>BillyDriveLib · Cubic Bezier</small></div><span className="live-dot"/></div>
+        <div className="project-card"><div className="project-icon"><Bot size={18}/></div><div className="project-info"><b>FTC Autonomous</b><small>BillyDriveLib v2.1 · Pure Pursuit</small></div><span className="live-dot"/></div>
         <div className="section-label">ROBOT · REQUIRED FIRST</div>
         <button className="wide-action" onClick={createRobot}><Bot size={15}/>{robot?'Robot created':'Create robot'}{robot?<span className="checkmark">✓</span>:<Plus size={14}/>}</button>
         {robot&&<div className="field-grid"><label>X <input type="number" value={robot.x.toFixed(0)} onChange={e=>setRobot({...robot,x:Number(e.target.value)})}/><small>mm</small></label><label>Y <input type="number" value={robot.y.toFixed(0)} onChange={e=>setRobot({...robot,y:Number(e.target.value)})}/><small>mm</small></label><label className="full">Heading <input type="number" value={robot.heading} onChange={e=>setRobot({...robot,heading:Number(e.target.value)})}/><small>°</small></label></div>}
@@ -366,9 +402,9 @@ function App(){
         <div className="section-label">PATH TOOLS</div>
         <select className="preset-select movement-select" value={newPathType} onChange={e=>setNewPathType(e.target.value)} disabled={!robot}>{MOVEMENT_TYPES.map(t=><option key={t.value} value={t.value}>{t.label} · {t.description}</option>)}</select>
         <button className="wide-action" disabled={!robot} onClick={addPath}><Plus size={15}/> Add {MOVEMENT_TYPES.find(t=>t.value===newPathType)?.label}</button>
-        <div className="tool-list"><button className={tool==='select'?'tool active':'tool'} onClick={()=>setTool('select')}><MousePointer2 size={15}/> Select / drag</button><button className={tool==='pan'?'tool active':'tool'} onClick={()=>setTool('pan')}><Crosshair size={15}/> Pan field</button><button className="tool" disabled={!robot} onClick={addObstacle}><Square size={15}/> Add square obstacle <Plus size={13}/></button><button className="tool" disabled={!obstacles.length||selected<0} onClick={optimize}><Route size={15}/> Suggest detour</button></div>
+        <div className="tool-list"><button className={tool==='select'?'tool active':'tool'} onClick={()=>setTool('select')}><MousePointer2 size={15}/> Select / drag</button><button className={tool==='pan'?'tool active':'tool'} onClick={()=>setTool('pan')}><Crosshair size={15}/> Pan field</button><button className="tool" disabled={!robot} onClick={addObstacle}><Square size={15}/> Add no-go zone <Plus size={13}/></button><button className="tool" disabled={!robot} onClick={beginAddSmartPoint}><Crosshair size={15}/> Add Smart Point <Plus size={13}/></button><button className="tool" disabled={!smartPoints.length} onClick={optimize}><WandSparkles size={15}/> Auto create path</button></div>
         <div className="section-label">DISPLAY</div><div className="toggle-row"><span><Grid3X3 size={14}/> Grid</span><button className={`switch ${showGrid?'on':''}`} onClick={()=>setShowGrid(!showGrid)}/></div><div className="toggle-row"><span><Eye size={14}/> Path labels</span><button className={`switch ${showLabels?'on':''}`} onClick={()=>setShowLabels(!showLabels)}/></div>
-        <div className="left-footer">BillyPath Studio <span>v0.6</span></div>
+        <div className="left-footer">BillyPath Studio <span>v0.7</span></div>
       </aside>
       <main className="main-area">
         <div className="canvas-toolbar"><div className="view-tabs"><button className={view==='2d'?'selected':''} onClick={()=>setView('2d')}><Grid3X3 size={14}/> 2D Field</button><button className={view==='3d'?'selected':''} onClick={()=>setView('3d')}><Box size={14}/> 3D Preview</button></div><div className="canvas-tools"><span className="coord-readout">+X FORWARD <i/> +Y RIGHT</span><button className="icon-btn" onClick={()=>{setCurrentTime(0);setPlaying(false)}} title="Reset simulation"><RotateCcw size={14}/></button></div></div>
@@ -380,7 +416,7 @@ function App(){
             {field.preset!=='custom'&&<g opacity=".8">{fieldDecoration()}</g>}
             {showGrid&&<g>{fieldTiles}</g>}
             <rect x="4" y="4" width="992" height="992" fill="none" stroke="#8b8e98" strokeWidth="8"/>
-            {obstacles.map((o,i)=>{const p=worldToSvg(o),size=o.size*scale;return <g key={o.id}><rect data-obstacle={i} x={p.x-size/2} y={p.y-size/2} width={size} height={size} fill="#e34450" fillOpacity=".24" stroke="#ff5b66" strokeWidth="3" rx="2"/><rect data-resize={i} x={p.x+size/2-9} y={p.y+size/2-9} width="18" height="18" fill="#ff727b" stroke="#fff" strokeWidth="2"/><text x={p.x} y={p.y-size/2-10} textAnchor="middle" fill="#ffb3b8" fontSize="18">{Math.round(o.size)} mm</text></g>})}
+            {obstacles.map((o,i)=>{const p=worldToSvg(o),length=(o.length||o.size||420)*scale,width=(o.width||o.size||420)*scale,active=selectedObstacle===i;return <g key={o.id}><rect data-obstacle={i} x={p.x-width/2} y={p.y-length/2} width={width} height={length} fill="#e34450" fillOpacity={active?'.34':'.24'} stroke={active?'#fff':'#ff5b66'} strokeWidth="3" rx="2"/><circle data-resize-length={i} cx={p.x} cy={p.y-length/2} r="8" fill="#ff727b" stroke="#fff" strokeWidth="2"/><circle data-resize-width={i} cx={p.x+width/2} cy={p.y} r="8" fill="#ff727b" stroke="#fff" strokeWidth="2"/><text x={p.x} y={p.y-length/2-10} textAnchor="middle" fill="#ffb3b8" fontSize="18">{o.name||`Zone ${i+1}`} · {Math.round(o.length||o.size||420)} × {Math.round(o.width||o.size||420)} mm</text></g>})}
             {segments.map((s,i)=>{
               const pts=samples(s,70).map(worldToSvg),d=pts.map((p,j)=>`${j?'L':'M'}${p.x},${p.y}`).join(' '),active=i===selected
               const keys=s.type==='bezier'?['p0','p1','p2','p3']:s.type==='arc'?['p0','center','p3']:['linear','pose','turn'].includes(s.type)?['p0','p3']:(s.waypoints||[]).map((_,j)=>`wp-${j}`)
@@ -394,31 +430,32 @@ function App(){
                 </>}
               </g>
             })}
+            {smartPoints.map((p,i)=>{const q=worldToSvg(p),active=selectedSmartPoint===i;return <g key={p.id}><circle data-smart-point={i} cx={q.x} cy={q.y} r={active?17:13} fill={active?'#fff':'#55e6c1'} stroke="#102520" strokeWidth="5"/><text x={q.x+17} y={q.y-12} fill="#a9ffe7" fontSize="17" stroke="#17181d" strokeWidth="4" paintOrder="stroke">{p.name||`Smart Point ${i+1}`}</text></g>})}
             {robot&&<g transform={`translate(${handle(currentPose||robot).x} ${handle(currentPose||robot).y}) rotate(${((currentPose||robot).heading||0)})`}><rect data-robot="true" x="-23" y="-30" width="46" height="60" rx="8" fill="#f2f2f3" stroke="#e33b46" strokeWidth="5"/><path d="M0 -40 L-10 -25 L10 -25 Z" fill="#e33b46"/><circle cx="-14" cy="-20" r="4" fill="#28292e"/><circle cx="14" cy="-20" r="4" fill="#28292e"/><circle cx="-14" cy="20" r="4" fill="#28292e"/><circle cx="14" cy="20" r="4" fill="#28292e"/></g>}
             {!robot&&<g><rect x="250" y="410" width="500" height="180" rx="18" fill="#292a31" stroke="#52545e" strokeDasharray="9 8"/><text x="500" y="480" fill="#f0f0f2" fontSize="30" textAnchor="middle">Create a robot first</text><text x="500" y="525" fill="#a1a3ad" fontSize="19" textAnchor="middle">Path tools unlock after placing your robot</text></g>}
-            {addZone&&<text x="500" y="48" textAnchor="middle" fill="#ffb4b8" fontSize="20">Tap/click field to place a square no-go zone</text>}
+            {addZone&&<text x="500" y="48" textAnchor="middle" fill="#ffb4b8" fontSize="20">Click field to place rectangular no-go zone</text>}{addSmartPoint&&<text x="500" y="48" textAnchor="middle" fill="#a9ffe7" fontSize="20">Click field to add Smart Point</text>}
           </svg>:<Scene3D segments={segments} robot={robot?currentPose:null} field={field} obstacles={obstacles}/>}
-          <div className="canvas-legend"><span><i className="legend-line"/> Path</span><span><i className="legend-dot"/> Control point</span><span><i className="legend-zone"/> Square obstacle</span></div>
+          <div className="canvas-legend"><span><i className="legend-line"/> Path</span><span><i className="legend-dot"/> Smart point</span><span><i className="legend-zone"/> No-go rectangle</span></div>
         </div>
         <div className="timeline-panel">
           <div className="timeline-head"><div className="timeline-title"><Clock3 size={15}/><b>SIMULATION TIMELINE</b><span className="muted">{segments.length} commands</span></div><div className="timeline-controls"><button className="icon-btn" onClick={()=>{setPlaying(false);setCurrentTime(0)}}><RotateCcw size={14}/></button><button className="play-btn" disabled={!robot||!segments.length} onClick={play}>{playing?<Pause size={13}/>:<Play size={13} fill="currentColor"/>}{playing?'Pause':'Simulate'}</button><span className="time-total">{fmt(currentTime)} / {fmt(totalTime)}</span></div></div>
           <input className="timeline-slider" type="range" min="0" max={Math.max(.01,totalTime)} step=".01" value={Math.min(currentTime,totalTime)} onChange={e=>seek(e.target.value)} disabled={!segments.length}/>
-          <div className="segment-row">{segments.map((s,i)=><button key={s.id} className={`segment-chip ${selected===i?'active':''} ${activeIndex===i?'playing':''}`} onClick={()=>{setSelected(i);let t=0;for(let j=0;j<i;j++)t+=metrics(segments[j]).time;seek(t)}}><span className="segment-index">{String(i+1).padStart(2,'0')}</span><span>{s.name}</span><small>{s.type.toUpperCase()} · {fmt(metrics(s).time)}</small></button>)}<button className="add-segment" disabled={!robot} onClick={addPath}><Plus size={15}/> Add path</button></div>
+          <div className="segment-row">{segments.map((s,i)=><button key={s.id} className={`segment-chip ${selected===i?'active':''} ${activeIndex===i?'playing':''}`} onClick={()=>{setSelected(i);setSelectedObstacle(-1);let t=0;for(let j=0;j<i;j++)t+=metrics(segments[j]).time;seek(t)}}><span className="segment-index">{String(i+1).padStart(2,'0')}</span><span>{s.name}</span><small>{s.type.toUpperCase()} · {fmt(metrics(s).time)}</small></button>)}<button className="add-segment" disabled={!robot} onClick={addPath}><Plus size={15}/> Add path</button></div>
           <div className="timeline-foot"><span>0.00 s</span><span>{robot?`Robot: X ${currentPose.x.toFixed(0)} · Y ${currentPose.y.toFixed(0)} · θ ${currentPose.heading.toFixed(1)}°`:'Create a robot to begin'}</span><span>{fmt(totalTime)}</span></div>
         </div>
       </main>
       <aside className={`right-panel ${rightOpen?'':'collapsed'}`}>
-        <div className="inspector-head"><div><span className="section-kicker">INSPECTOR</span><h3>{selectedObstacle>=0&&obstacles[selectedObstacle]?'Obstacle settings':'Path settings'}</h3></div><button className="icon-btn panel-collapse" onClick={()=>setRightOpen(v=>!v)}><ChevronRight size={15}/></button></div>
-        {selectedObstacle>=0&&obstacles[selectedObstacle]?<><div className="path-name"><Square size={15} color="#ff626c"/><b>Square no-go zone</b></div><div className="inspector-section"><div className="inspector-section-title">POSITION · MM</div><div className="field-grid"><label>X<input type="number" value={obstacles[selectedObstacle].x.toFixed(0)} onChange={e=>setObstacles(old=>old.map((o,i)=>i===selectedObstacle?{...o,x:Number(e.target.value)}:o))}/></label><label>Y<input type="number" value={obstacles[selectedObstacle].y.toFixed(0)} onChange={e=>setObstacles(old=>old.map((o,i)=>i===selectedObstacle?{...o,y:Number(e.target.value)}:o))}/></label></div></div><div className="inspector-section"><div className="inspector-section-title">SQUARE SIZE</div><label className="range-label">Side length <b>{obstacles[selectedObstacle].size} mm</b></label><input className="range" type="range" min="100" max="1800" step="10" value={obstacles[selectedObstacle].size} onChange={e=>setObstacles(old=>old.map((o,i)=>i===selectedObstacle?{...o,size:Number(e.target.value)}:o))}/><input className="numeric-size" type="number" min="100" max="3000" value={obstacles[selectedObstacle].size} onChange={e=>setObstacles(old=>old.map((o,i)=>i===selectedObstacle?{...o,size:Math.max(100,Number(e.target.value))}:o))}/><button className="wide-outline danger" onClick={()=>{setObstacles(old=>old.filter((_,i)=>i!==selectedObstacle));setSelectedObstacle(-1)}}><Trash2 size={14}/> Delete obstacle</button></div></>:seg?<><div className="path-name"><div className="path-color"/><input value={seg.name} onChange={e=>updateSegment(selected,{name:e.target.value})}/><span className="tiny-badge">{seg.type.toUpperCase()}</span></div><div className="inspector-section"><div className="inspector-section-title">MOVEMENT TYPE</div><select className="preset-select" value={seg.type} onChange={e=>updateSegment(selected,{type:e.target.value})}>{MOVEMENT_TYPES.map(t=><option key={t.value} value={t.value}>{t.label}</option>)}</select></div>
+        <div className="inspector-head"><div><span className="section-kicker">INSPECTOR</span><h3>{selectedObstacle>=0&&obstacles[selectedObstacle]?'No-go zone settings':selectedSmartPoint>=0&&smartPoints[selectedSmartPoint]?'Smart Point settings':'Path settings'}</h3></div><button className="icon-btn panel-collapse" onClick={()=>setRightOpen(v=>!v)}><ChevronRight size={15}/></button></div>
+        {selectedObstacle>=0&&obstacles[selectedObstacle]?<><div className="path-name"><Square size={15} color="#ff626c"/><input value={obstacles[selectedObstacle].name||`Zone ${selectedObstacle+1}`} onChange={e=>setObstacles(old=>old.map((o,i)=>i===selectedObstacle?{...o,name:e.target.value}:o))} aria-label="Zone name"/></div><div className="inspector-section"><div className="inspector-section-title">POSITION · MM</div><div className="field-grid"><label>X<input type="number" value={obstacles[selectedObstacle].x.toFixed(0)} onChange={e=>setObstacles(old=>old.map((o,i)=>i===selectedObstacle?{...o,x:Number(e.target.value)}:o))}/></label><label>Y<input type="number" value={obstacles[selectedObstacle].y.toFixed(0)} onChange={e=>setObstacles(old=>old.map((o,i)=>i===selectedObstacle?{...o,y:Number(e.target.value)}:o))}/></label></div><label className="range-label">Length · X <b>{Math.round(obstacles[selectedObstacle].length||obstacles[selectedObstacle].size||420)} mm</b></label><input className="range" type="range" min="100" max="2500" step="10" value={obstacles[selectedObstacle].length||obstacles[selectedObstacle].size||420} onChange={e=>setObstacles(old=>old.map((o,i)=>i===selectedObstacle?{...o,length:Number(e.target.value)}:o))}/><label className="range-label">Width · Y <b>{Math.round(obstacles[selectedObstacle].width||obstacles[selectedObstacle].size||420)} mm</b></label><input className="range" type="range" min="100" max="2500" step="10" value={obstacles[selectedObstacle].width||obstacles[selectedObstacle].size||420} onChange={e=>setObstacles(old=>old.map((o,i)=>i===selectedObstacle?{...o,width:Number(e.target.value)}:o))}/><div className="point-lock-note">Kéo nút trên để chỉnh chiều dài X, nút bên phải để chỉnh chiều rộng Y.</div><div className="tool-list"><button className="tool" disabled={selectedObstacle<=0} onClick={()=>moveObstacle(-1)}>↑ Move zone up</button><button className="tool" disabled={selectedObstacle>=obstacles.length-1} onClick={()=>moveObstacle(1)}>↓ Move zone down</button></div><button className="wide-outline danger" onClick={()=>removeObstacle(selectedObstacle)}><Trash2 size={14}/> Delete no-go zone</button></div></>:selectedSmartPoint>=0&&smartPoints[selectedSmartPoint]?<><div className="path-name"><Crosshair size={16} color="#55e6c1"/><input value={smartPoints[selectedSmartPoint].name||`Smart Point ${selectedSmartPoint+1}`} onChange={e=>setSmartPoints(old=>old.map((p,i)=>i===selectedSmartPoint?{...p,name:e.target.value}:p))} aria-label="Smart point name"/></div><div className="inspector-section"><div className="inspector-section-title">SMART POINT · MM</div><div className="field-grid"><label>X<input type="number" value={smartPoints[selectedSmartPoint].x.toFixed(0)} onChange={e=>setSmartPoints(old=>old.map((p,i)=>i===selectedSmartPoint?{...p,x:Number(e.target.value)}:p))}/></label><label>Y<input type="number" value={smartPoints[selectedSmartPoint].y.toFixed(0)} onChange={e=>setSmartPoints(old=>old.map((p,i)=>i===selectedSmartPoint?{...p,y:Number(e.target.value)}:p))}/></label></div><div className="tool-list"><button className="tool" disabled={selectedSmartPoint<=0} onClick={()=>moveSmartPoint(-1)}>↑ Move point up</button><button className="tool" disabled={selectedSmartPoint>=smartPoints.length-1} onClick={()=>moveSmartPoint(1)}>↓ Move point down</button></div><button className="wide-outline danger" onClick={()=>removeSmartPoint(selectedSmartPoint)}><Trash2 size={14}/> Delete Smart Point</button></div></>:seg?<><div className="path-name"><div className="path-color"/><input value={seg.name} onChange={e=>updateSegment(selected,{name:e.target.value})}/><span className="tiny-badge">{seg.type.toUpperCase()}</span></div><div className="inspector-section"><div className="inspector-section-title">MOVEMENT TYPE</div><select className="preset-select" value={seg.type} onChange={e=>updateSegment(selected,{type:e.target.value})}>{MOVEMENT_TYPES.map(t=><option key={t.value} value={t.value}>{t.label}</option>)}</select></div>
         <div className="inspector-section"><div className="inspector-section-title">{seg.type==='bezier'?'BEZIER CONTROL POINTS':seg.type==='linear'?'LINE ENDPOINTS':seg.type==='arc'?'ARC CONTROL':'WAYPOINTS'} <span>MM</span></div>
         {(seg.type==='turn'?[]:seg.type==='bezier'?['p0','p1','p2','p3']:['linear','pose'].includes(seg.type)?['p0','p3']:seg.type==='arc'?['p0','center','p3']:(seg.waypoints||[]).map((_,j)=>`wp-${j}`)).map(k=>{const p=k.startsWith('wp-')?seg.waypoints[Number(k.slice(3))]:seg[k];return <div className={`point-editor ${selectedPoint===k?'point-selected':''}`} key={k} onClick={()=>setSelectedPoint(k)}><div className="point-tag">{k.startsWith('wp-')?`W${Number(k.slice(3))+1}`:k.toUpperCase()}</div><div className="point-inputs"><label>X<input type="number" value={p.x.toFixed(0)} onChange={e=>updatePoint(selected,k,'x',e.target.value)}/></label><label>Y<input type="number" value={p.y.toFixed(0)} onChange={e=>updatePoint(selected,k,'y',e.target.value)}/></label></div></div>})}
-        {(seg.type==='polyline'||seg.type==='spline')&&<button className="wide-outline" onClick={()=>{const w=[...(seg.waypoints||[])],last=w[w.length-1],prev=w[w.length-2]||w[0];w.splice(w.length-1,0,{x:(prev.x+last.x)/2,y:(prev.y+last.y)/2});updateSegment(selected,{waypoints:w})}}><Plus size={13}/> Add waypoint</button>}
+        {(seg.type==='polyline'||seg.type==='spline'||seg.type==='smart')&&<button className="wide-outline" onClick={()=>{const w=[...(seg.waypoints||[])],last=w[w.length-1],prev=w[w.length-2]||w[0];w.splice(w.length-1,0,{x:(prev.x+last.x)/2,y:(prev.y+last.y)/2});updateSegment(selected,{waypoints:w})}}><Plus size={13}/> Add waypoint</button>}
         <div className="point-lock-note">{seg.type==='turn'?'Rotation is performed at the current robot position.':'Start point is linked to the robot or previous path endpoint. End point links to the next segment.'}</div></div>
-        <div className="inspector-section"><div className="inspector-section-title">{seg.type==='turn'?'ROTATION TARGET':'ROBOT HEADING'}</div>{seg.type!=='turn'&&<select className="preset-select" value={seg.headingMode} onChange={e=>updateSegment(selected,{headingMode:e.target.value})}><option value="constant">Constant heading</option><option value="linear">Linear heading</option><option value="tangent">Tangent to path</option><option value="interpolated">Interpolated start → end</option></select>}{(seg.type==='turn'||seg.headingMode!=='tangent')&&<div className="field-grid"><label>Start °<input type="number" value={seg.headingStart} onChange={e=>updateSegment(selected,{headingStart:Number(e.target.value)})}/></label><label>End °<input type="number" value={seg.headingEnd} onChange={e=>updateSegment(selected,{headingEnd:Number(e.target.value)})}/></label></div>}</div>{seg.type==='turn'&&<div className="inspector-section"><div className="inspector-section-title">ROTATION CONSTRAINTS</div><label className="range-label">Max angular velocity <b>{seg.maxAngularVelocity||180} °/s</b></label><input className="range" type="range" min="30" max="720" step="10" value={seg.maxAngularVelocity||180} onChange={e=>updateSegment(selected,{maxAngularVelocity:Number(e.target.value)})}/><label className="range-label">Max angular acceleration <b>{seg.maxAngularAcceleration||360} °/s²</b></label><input className="range" type="range" min="60" max="1440" step="20" value={seg.maxAngularAcceleration||360} onChange={e=>updateSegment(selected,{maxAngularAcceleration:Number(e.target.value)})}/></div>}{seg.type!=='turn'&&<div className="inspector-section"><div className="inspector-section-title">MOTION CONSTRAINTS</div><label className="range-label">Max velocity <b>{seg.maxVelocity} mm/s</b></label><input className="range" type="range" min="50" max="1000" step="10" value={seg.maxVelocity} onChange={e=>updateSegment(selected,{maxVelocity:Number(e.target.value)})}/><label className="range-label">Max acceleration <b>{seg.maxAcceleration} mm/s²</b></label><input className="range" type="range" min="50" max="2000" step="25" value={seg.maxAcceleration} onChange={e=>updateSegment(selected,{maxAcceleration:Number(e.target.value)})}/></div>}<div className="inspector-section"><div className="inspector-section-title">ACTION MARKERS <span>AFTER THIS SEGMENT</span></div><button className="wide-outline" onClick={addActionMarker}><Plus size={13}/> Add action marker</button>{(seg.actions||[]).map((action,actionIndex)=><div className="action-marker-editor" key={action.id}><div className="action-marker-label">ACTION {actionIndex+1} · RUN AFTER SEGMENT</div><div className="action-marker-row"><input value={action.name} onChange={e=>updateActionMarker(action.id,e.target.value)} placeholder="onAction1"/><button className="icon-btn" title="Remove action" onClick={()=>removeActionMarker(action.id)}><Trash2 size={13}/></button></div><small>Export tạo lời gọi hàm và một method TODO bên ngoài runOpMode().</small></div>)}</div><div className="inspector-section"><div className="inspector-section-title">PATH ANALYSIS</div><div className="metric-grid"><div className="metric"><small>Path length</small><b>{(metrics(seg).length/10).toFixed(1)} <em>cm</em></b></div><div className="metric"><small>Estimated time</small><b>{metrics(seg).time.toFixed(2)} <em>s</em></b></div></div></div><div className="inspector-section"><button className="wide-outline" onClick={addPath}><Plus size={14}/> Continue from route end</button><button className="wide-outline danger" onClick={deletePath}><Trash2 size={14}/> Delete segment</button></div></>:<div className="empty-inspector"><Bot size={26}/><b>No path selected</b><span>Create a robot, then add a path. Select a segment to edit its Bezier points.</span></div>}
+        <div className="inspector-section"><div className="inspector-section-title">{seg.type==='turn'?'ROTATION TARGET':'ROBOT HEADING'}</div>{seg.type!=='turn'&&<select className="preset-select" value={seg.headingMode} onChange={e=>updateSegment(selected,{headingMode:e.target.value})}><option value="constant">Constant heading</option><option value="linear">Linear heading</option><option value="tangent">Tangent to path</option><option value="interpolated">Interpolated start → end</option></select>}{(seg.type==='turn'||seg.headingMode!=='tangent')&&<div className="field-grid"><label>Start °<input type="number" value={seg.headingStart} onChange={e=>updateSegment(selected,{headingStart:Number(e.target.value)})}/></label><label>End °<input type="number" value={seg.headingEnd} onChange={e=>updateSegment(selected,{headingEnd:Number(e.target.value)})}/></label></div>}</div>{seg.type==='turn'&&<div className="inspector-section"><div className="inspector-section-title">ROTATION CONSTRAINTS</div><label className="range-label">Max angular velocity <b>{seg.maxAngularVelocity||180} °/s</b></label><input className="range" type="range" min="30" max="720" step="10" value={seg.maxAngularVelocity||180} onChange={e=>updateSegment(selected,{maxAngularVelocity:Number(e.target.value)})}/><label className="range-label">Max angular acceleration <b>{seg.maxAngularAcceleration||360} °/s²</b></label><input className="range" type="range" min="60" max="1440" step="20" value={seg.maxAngularAcceleration||360} onChange={e=>updateSegment(selected,{maxAngularAcceleration:Number(e.target.value)})}/></div>}{seg.type!=='turn'&&<div className="inspector-section"><div className="inspector-section-title">MOTION CONSTRAINTS</div><label className="range-label">Max velocity <b>{seg.maxVelocity} mm/s</b></label><input className="range" type="range" min="50" max="1000" step="10" value={seg.maxVelocity} onChange={e=>updateSegment(selected,{maxVelocity:Number(e.target.value)})}/><label className="range-label">Max acceleration <b>{seg.maxAcceleration} mm/s²</b></label><input className="range" type="range" min="50" max="2000" step="25" value={seg.maxAcceleration} onChange={e=>updateSegment(selected,{maxAcceleration:Number(e.target.value)})}/></div>}<div className="inspector-section"><div className="inspector-section-title">ACTION MARKERS <span>AFTER THIS SEGMENT</span></div><button className="wide-outline" onClick={addActionMarker}><Plus size={13}/> Add action marker</button>{(seg.actions||[]).map((action,actionIndex)=><div className="action-marker-editor" key={action.id}><div className="action-marker-label">ACTION {actionIndex+1} · RUN AFTER SEGMENT</div><div className="action-marker-row"><input value={action.name} onChange={e=>updateActionMarker(action.id,e.target.value)} placeholder="onAction1"/><button className="icon-btn" title="Remove action" onClick={()=>removeActionMarker(action.id)}><Trash2 size={13}/></button></div><small>Export tạo lời gọi hàm và một method TODO bên ngoài runOpMode().</small></div>)}</div><div className="inspector-section"><div className="inspector-section-title">PATH ANALYSIS</div><div className="metric-grid"><div className="metric"><small>Path length</small><b>{(metrics(seg).length/10).toFixed(1)} <em>cm</em></b></div><div className="metric"><small>Estimated time</small><b>{metrics(seg).time.toFixed(2)} <em>s</em></b></div></div></div><div className="inspector-section"><button className="wide-outline" onClick={addPath}><Plus size={14}/> Continue from route end</button><div className="tool-list"><button className="tool" disabled={selected<=0} onClick={()=>movePath(-1)}>↑ Move path up</button><button className="tool" disabled={selected>=segments.length-1} onClick={()=>movePath(1)}>↓ Move path down</button></div><button className="wide-outline danger" onClick={deletePath}><Trash2 size={14}/> Delete path</button></div></>:<div className="empty-inspector"><Bot size={26}/><b>No path selected</b><span>Create a robot, then add a path. Select a segment to edit its Bezier points.</span></div>}
         <div className="right-summary"><div className="summary-top"><Route size={14}/> ROUTE SUMMARY</div><div className="summary-stat"><span>Total distance</span><b>{(totalDistance/10).toFixed(1)} cm</b></div><div className="summary-stat"><span>Estimated runtime</span><b className="red-text">{fmt(totalTime)}</b></div><div className="summary-stat"><span>Obstacles</span><b>{obstacles.length}</b></div></div>
       </aside>
     </div>
-    {exportOpen&&<div className="modal-backdrop" onClick={()=>setExportOpen(false)}><div className="export-modal" onClick={e=>e.stopPropagation()}><div className="modal-head"><div><span className="section-kicker">CODE GENERATOR</span><h2>Export Java</h2><p>Generated for your BillyDriveLib · {segments.length} motion commands</p></div><button className="icon-btn" onClick={()=>setExportOpen(false)}>×</button></div><label className="export-name">OpMode class name<input value={className} onChange={e=>setClassName(e.target.value)}/></label><div className="code-window"><div className="code-title"><Code2 size={14}/>{className||'BillyAuto'}.java <span>JAVA</span></div><pre>{code}</pre></div><div className="export-warning">Export uses PathBuilder, LINEAR Bezier followPath actions, in-place turnTo(), and optional action markers with editable helper methods. Test at low power first.</div><div className="modal-actions"><button className="btn ghost" onClick={copyCode}><Copy size={14}/> Copy code</button><button className="btn primary" onClick={downloadCode}><Download size={14}/> Download .java</button></div></div></div>}
+    {exportOpen&&<div className="modal-backdrop" onClick={()=>setExportOpen(false)}><div className="export-modal" onClick={e=>e.stopPropagation()}><div className="modal-head"><div><span className="section-kicker">CODE GENERATOR</span><h2>Export Java</h2><p>Generated for BillyDriveLib v2.1 · {segments.length} motion commands</p></div><button className="icon-btn" onClick={()=>setExportOpen(false)}>×</button></div><label className="export-name">OpMode class name<input value={className} onChange={e=>setClassName(e.target.value)}/></label><div className="code-window"><div className="code-title"><Code2 size={14}/>{className||'BillyAuto'}.java <span>JAVA</span></div><pre>{code}</pre></div><div className="export-warning">Generated with BillyDriveLib v2.1 PathBuilder and ConfigValues. Per-path velocity and acceleration use the most conservative limits across this route. Review export notes for unsupported heading or turn settings.</div><div className="modal-actions"><button className="btn ghost" onClick={copyCode}><Copy size={14}/> Copy code</button><button className="btn primary" onClick={downloadCode}><Download size={14}/> Download .java</button></div></div></div>}
     {toast&&<div className="toast">{toast}</div>}
   </div>
 }
